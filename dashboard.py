@@ -602,12 +602,9 @@ header h1 span{color:var(--text);transition:color .2s}
 #status{color:var(--text3);font-size:11px;font-family:var(--font-ui),system-ui,sans-serif}
 
 /* Toolbar (in header) */
-#ssh-input{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:7px 12px;
-  color:var(--text);font-family:var(--font-ui),system-ui,sans-serif;font-size:11px;outline:none;transition:border-color .2s;width:180px}
-#ssh-input:focus{border-color:var(--blue)}
-#ssh-btn{background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:7px 14px;
-  color:var(--text2);font-size:11px;cursor:pointer;font-family:var(--font-ui),sans-serif;font-weight:500;transition:all .15s}
-#ssh-btn:hover{background:var(--blue);color:#0d1117;border-color:var(--blue)}
+#upload-btn{background:transparent;border:none;padding:5px 8px;
+  color:var(--text3);font-size:13px;cursor:pointer;font-family:var(--font-ui),sans-serif;font-weight:500;transition:color .15s;display:inline-block}
+#upload-btn:hover{color:var(--text)}
 .run-list{display:flex;gap:6px;flex-wrap:wrap}
 .run-tag{background:var(--surface);border:1px solid var(--border);border-radius:20px;padding:5px 14px;
   font-size:11px;font-weight:500;cursor:default;transition:all .15s}
@@ -677,9 +674,11 @@ header h1 span{color:var(--text);transition:color .2s}
 </div>
 <header>
   <div class="hdr-left">
-    <input id="ssh-input" type="text" placeholder="root@host:port" spellcheck="false" style="display:none">
-    <button id="ssh-btn" style="display:none">Connect</button>
     <div class="run-list" id="run-list"></div>
+    <label id="upload-btn" title="Upload .log file">
+      <input type="file" id="file-input" accept=".log,.txt" multiple style="display:none">
+      <span style="cursor:pointer">+</span>
+    </label>
   </div>
   <span id="status"><span id="s-time" style="display:none"></span></span>
   <h1 id="logo-h1"><span id="logo-text">pgolf dashboard</span></h1>
@@ -737,8 +736,7 @@ function getPlotTheme(){
 let DL=getPlotTheme();
 const THEME_LINE={dark:'#e4e4e7',kitty:'#f9a8d4',emerald:'#f0a878'};
 function getLineColor(){const t=document.documentElement.getAttribute('data-theme')||'dark';return THEME_LINE[t]||'#e4e4e7'}
-const COLORS_BASE=['#f87171','#4ade80','#fbbf24','#c084fc','#fb7185','#38bdf8','#fb923c'];
-function getCOLORS(){return [getLineColor(),...COLORS_BASE]}
+const DASH_STYLES=['solid','dash','dot','dashdot','longdash','longdashdot'];
 let use24h=localStorage.getItem('pgolf-24h')!=='false';
 const RATE_OPTIONS=[5000,10000,30000,60000];
 let rateIdx=parseInt(localStorage.getItem('pgolf-rate-idx'))||0;
@@ -869,7 +867,7 @@ function _render(data){
       label.textContent=r.name||k;
     }
     tag.appendChild(label);
-    if(r.source==='upload'){
+    if(r.source!=='ssh'){
       const x=document.createElement('span');
       x.className='x';
       x.textContent='×';
@@ -1110,8 +1108,11 @@ function _render(data){
   keys.forEach((k,i)=>{
     const r=runs[k];
     if(r.val_steps.length){
-      bpbTraces.push({x:r.val_steps,y:r.val_bpb,mode:'lines+markers',marker:{size:4},
-        line:{color:getCOLORS()[i%getCOLORS().length],width:i===0?2.5:1.5,dash:i===0?'solid':'dash'},name:r.name||k});
+      const lc=getLineColor();
+      const opacity=i===0?1:0.45;
+      const rgba=lc.startsWith('#')?'rgba('+parseInt(lc.slice(1,3),16)+','+parseInt(lc.slice(3,5),16)+','+parseInt(lc.slice(5,7),16)+','+opacity+')':lc;
+      bpbTraces.push({x:r.val_steps,y:r.val_bpb,mode:'lines+markers',marker:{size:i===0?4:3,color:rgba},
+        line:{color:rgba,width:i===0?2.5:1.5,dash:DASH_STYLES[i%DASH_STYLES.length]},name:r.name||k});
     }
   });
   safeUpdate('c-bpb',bpbTraces,bpbLayout);
@@ -1260,6 +1261,27 @@ async function removeRun(key){
   await fetch(`/api/remove?key=${encodeURIComponent(key)}&token=${encodeURIComponent(TOKEN)}`,{method:'POST'});
   refresh();
 }
+
+// File upload (button + drag&drop)
+async function uploadFiles(files){
+  for(const f of files){
+    const fd=new FormData();
+    fd.append('file',f);
+    await fetch(`/api/upload?token=${encodeURIComponent(TOKEN)}`,{method:'POST',body:fd});
+  }
+  refresh();
+}
+document.getElementById('file-input').addEventListener('change',function(e){
+  if(e.target.files.length)uploadFiles(e.target.files);
+  e.target.value='';
+});
+// Drag & drop anywhere on page
+document.addEventListener('dragover',function(e){e.preventDefault();e.dataTransfer.dropEffect='copy'});
+document.addEventListener('drop',function(e){
+  e.preventDefault();
+  const files=[...e.dataTransfer.files].filter(f=>f.name.endsWith('.log')||f.name.endsWith('.txt'));
+  if(files.length)uploadFiles(files);
+});
 document.getElementById('s-time').addEventListener('click',()=>{use24h=!use24h;localStorage.setItem('pgolf-24h',use24h);refresh()});
 function cycleRate(){
   rateManual=true;
