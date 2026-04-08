@@ -1,0 +1,10 @@
+world_size:8 gpu:NVIDIA H100 80GB HBM3  model_params:14500000 seed:42 max_wallclock_seconds:600 iterations:20000
+warmup_step:50/50
+step:50/20000 val_loss:3.8500 val_bpb:5.5525
+step:50/20000 train_loss:3.8200 train_time:5200ms step_avg:104.0ms
+step:100/20000 train_loss:3.5100 train_time:10400ms step_avg:104.0ms
+step:200/20000 train_loss:2.8000 train_time:20800ms step_avg:104.0ms
+Traceback (most recent call last):
+  File "train_gpt.py", line 450, in <module>
+    loss.backward()
+torch.cuda.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB

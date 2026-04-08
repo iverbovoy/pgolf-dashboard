@@ -27,6 +27,9 @@ import subprocess
 import time
 from pathlib import Path
 
+__version__ = "0.2.0"
+_start_ts = time.time()
+
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import HTMLResponse, JSONResponse
 import uvicorn
@@ -37,6 +40,9 @@ import uvicorn
 _runs: dict[str, dict] = {}  # name -> parsed data
 _ssh_cache = {"text": "", "ts": 0}
 _auth_token: str = secrets.token_urlsafe(24)
+_ssh_health = {"last_ok_ts": 0, "consecutive_failures": 0, "last_error": "", "status": "unknown"}
+_ssh_state = {"byte_offset": 0, "local_cache": ""}
+_webhook_sent: dict[str, set] = {}  # run_key -> set of events already sent
 _config = {
     "ssh_args": None,   # list[str] — parsed SSH arguments (no shell interpolation)
     "ssh_host": None,    # str — extracted host for pod matching
@@ -47,6 +53,10 @@ _config = {
     "auto_stop": False,
     "auto_stop_done": False,
     "save_dir": ".",
+    "baseline": None,
+    "webhook_url": None,
+    "webhook_threshold": None,
+    "ssh_targets": [],   # list of dicts for multi-SSH
 }
 
 
@@ -184,6 +194,17 @@ def parse_log(text: str) -> dict:
         if "final_ttt_exact" in line:
             d["status"] = "done"
 
+    # Crash/stall detection: check last 30 lines for error patterns
+    lines = text.splitlines()
+    crash_patterns = re.compile(r"(Traceback|CUDA out of memory|RuntimeError|torch\.cuda\.OutOfMemoryError|Killed|oom-kill)")
+    tail = lines[-30:] if len(lines) >= 30 else lines
+    for tline in reversed(tail):
+        cm = crash_patterns.search(tline)
+        if cm:
+            d["status"] = "crashed"
+            d["error_excerpt"] = tline.strip()[:200]
+            break
+
     return d
 
 
@@ -221,44 +242,145 @@ def _extract_ssh_host(ssh_args: list[str]) -> str | None:
 _SAFE_LOG_PATH = re.compile(r"^/[\w./_-]+\.log$")
 
 
+def _fetch_ssh_target(target: dict) -> str:
+    """Fetch log from a single SSH target with incremental tailing and health tracking."""
+    ssh_args = target["ssh_args"]
+    remote_log = target["remote_log"]
+    health = target["health"]
+    if not ssh_args or not remote_log:
+        return ""
+    now = time.time()
+    try:
+        remote = remote_log
+        if remote == "LATEST":
+            lr = subprocess.run(
+                ssh_args + ["ls -t /workspace/*.log 2>/dev/null | head -1"],
+                capture_output=True, text=True, timeout=10)
+            new_remote = lr.stdout.strip() or "/workspace/train.log"
+            if not _SAFE_LOG_PATH.match(new_remote):
+                print(f"[warn] Ignoring suspicious log filename: {new_remote!r}")
+                return ""
+            if new_remote != target.get("_resolved_log"):
+                target["local_cache"] = ""
+                target["byte_offset"] = 0
+                _config["auto_stop_done"] = False  # re-arm for new run
+            remote = new_remote
+            target["_resolved_log"] = remote
+        # Incremental fetch: get remote file size first
+        sr = subprocess.run(
+            ssh_args + [f"stat -c %s {remote}"],
+            capture_output=True, text=True, timeout=10)
+        if sr.returncode == 0 and sr.stdout.strip().isdigit():
+            remote_size = int(sr.stdout.strip())
+            cur_offset = target["byte_offset"]
+            if remote_size < cur_offset:
+                # File rotated/truncated — reset
+                target["byte_offset"] = 0
+                target["local_cache"] = ""
+                cur_offset = 0
+            if remote_size > cur_offset:
+                # Fetch only new bytes
+                r = subprocess.run(
+                    ssh_args + [f"tail -c +{cur_offset + 1} {remote}"],
+                    capture_output=True, text=True, timeout=20)
+                if r.returncode == 0:
+                    target["local_cache"] += r.stdout
+                    target["byte_offset"] = remote_size
+            # Success
+            health["last_ok_ts"] = now
+            health["consecutive_failures"] = 0
+            health["last_error"] = ""
+            health["status"] = "ok"
+            result = target["local_cache"]
+            if result:
+                Path("/tmp/pgolf_ssh_cache.log").write_text(result)
+            return result
+        else:
+            # stat failed — fallback to full cat
+            r = subprocess.run(
+                ssh_args + [f"cat {remote}"],
+                capture_output=True, text=True, timeout=20)
+            if r.returncode == 0 and r.stdout.strip():
+                target["local_cache"] = r.stdout
+                target["byte_offset"] = len(r.stdout.encode())
+                health["last_ok_ts"] = now
+                health["consecutive_failures"] = 0
+                health["last_error"] = ""
+                health["status"] = "ok"
+                Path("/tmp/pgolf_ssh_cache.log").write_text(r.stdout)
+                return r.stdout
+            raise RuntimeError(f"cat failed: rc={r.returncode}")
+    except Exception as e:
+        health["consecutive_failures"] += 1
+        health["last_error"] = str(e)[:200]
+        cf = health["consecutive_failures"]
+        if cf >= 5:
+            health["status"] = "failing"
+        elif cf >= 2:
+            health["status"] = "stale"
+    # Fallback: local cache file
+    cache = Path("/tmp/pgolf_ssh_cache.log")
+    if cache.exists():
+        t = cache.read_text()
+        target["local_cache"] = t
+        return t
+    return target.get("local_cache", "")
+
+
 def fetch_ssh_log() -> str:
-    if not _config["ssh_args"] or not _config["remote_log"]:
+    """Legacy single-SSH fetch — delegates to first SSH target."""
+    if not _config.get("ssh_targets"):
         return ""
     now = time.time()
     if now - _ssh_cache["ts"] < 5 and _ssh_cache["text"]:
         return _ssh_cache["text"]
+    target = _config["ssh_targets"][0]
+    text = _fetch_ssh_target(target)
+    # Sync global health from primary target
+    _ssh_health.update(target["health"])
+    if text:
+        _ssh_cache.update(text=text, ts=now)
+    return text
+
+
+def _send_webhook(run_data: dict, event: str):
+    """Send notification to Discord/Slack webhook."""
+    if not _config.get("webhook_url"):
+        return
+    import urllib.request
+    finals = run_data.get("finals", {})
+    best_bpb = finals.get("hedge") or finals.get("sliding") or finals.get("roundtrip") or "N/A"
+    artifact_mb = f'{finals["artifact_bytes"]/1e6:.2f} MB' if "artifact_bytes" in finals else "N/A"
+    payload = {
+        "content": f"**{event}** | {run_data.get('name', 'unknown')} | bpb: {best_bpb} | artifact: {artifact_mb}",
+    }
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(_config["webhook_url"], data=data, headers={"Content-Type": "application/json"})
     try:
-        remote = _config["remote_log"]
-        if remote == "LATEST":
-            # Always re-resolve to pick up new log files
-            lr = subprocess.run(
-                _config["ssh_args"] + ["ls -t /workspace/*.log 2>/dev/null | head -1"],
-                capture_output=True, text=True, timeout=10)
-            new_remote = lr.stdout.strip() or "/workspace/train.log"
-            # Validate filename to prevent injection via crafted filenames
-            if not _SAFE_LOG_PATH.match(new_remote):
-                print(f"[warn] Ignoring suspicious log filename: {new_remote!r}")
-                return ""
-            if new_remote != _config.get("_resolved_log"):
-                _ssh_cache.update(text="", ts=0)  # Reset cache for new file
-            remote = new_remote
-            _config["_resolved_log"] = remote
-        r = subprocess.run(
-            _config["ssh_args"] + [f"cat {remote}"],
-            capture_output=True, text=True, timeout=20)
-        if r.returncode == 0 and r.stdout.strip():
-            _ssh_cache.update(text=r.stdout, ts=now)
-            # Cache locally
-            Path("/tmp/pgolf_ssh_cache.log").write_text(r.stdout)
-            return r.stdout
-    except Exception:
-        pass
-    cache = Path("/tmp/pgolf_ssh_cache.log")
-    if cache.exists():
-        t = cache.read_text()
-        _ssh_cache.update(text=t, ts=now)
-        return t
-    return ""
+        urllib.request.urlopen(req, timeout=10)
+        print(f"[webhook] Sent: {event}")
+    except Exception as e:
+        print(f"[webhook] Failed: {e}")
+
+
+def _check_webhook_events(run_key: str, data: dict):
+    """Check and fire webhook events for a run, avoiding duplicates."""
+    if not _config.get("webhook_url"):
+        return
+    if run_key not in _webhook_sent:
+        _webhook_sent[run_key] = set()
+    sent = _webhook_sent[run_key]
+    # Training complete
+    if data.get("status") == "done" and "done" not in sent:
+        sent.add("done")
+        _send_webhook(data, "Training complete")
+    # BPB threshold crossing
+    threshold = _config.get("webhook_threshold")
+    if threshold is not None and data.get("val_bpb"):
+        last_bpb = data["val_bpb"][-1]
+        if last_bpb < threshold and "threshold" not in sent:
+            sent.add("threshold")
+            _send_webhook(data, f"BPB crossed {threshold}")
 
 
 def load_all_runs():
@@ -283,16 +405,27 @@ def load_all_runs():
             data["source"] = "compare"
             _runs[f"compare_{i}"] = data
 
-    # SSH
-    text = fetch_ssh_log()
-    if text:
-        data = parse_log(text)
-        data["name"] = "live (SSH)"
-        data["source"] = "ssh"
-        _runs["ssh"] = data
-        # Auto-stop: save log + stop pod when done
-        if _config["auto_stop"] and not _config["auto_stop_done"] and data["status"] == "done":
-            _auto_stop(text, data)
+    # Multi-SSH: loop over all targets
+    for idx, target in enumerate(_config.get("ssh_targets", [])):
+        now = time.time()
+        text = _fetch_ssh_target(target)
+        # Sync global health from first target
+        if idx == 0:
+            _ssh_health.update(target["health"])
+            _config["_resolved_log"] = target.get("_resolved_log", "")
+            if text:
+                _ssh_cache.update(text=text, ts=now)
+        if text:
+            run_key = f"ssh_{idx}" if len(_config["ssh_targets"]) > 1 else "ssh"
+            data = parse_log(text)
+            label = target.get("label", f"pod-{idx}")
+            data["name"] = f"live ({label})"
+            data["source"] = "ssh"
+            _runs[run_key] = data
+            _check_webhook_events(run_key, data)
+            # Auto-stop: save log + stop pod when done (only for first target)
+            if idx == 0 and _config["auto_stop"] and not _config["auto_stop_done"] and data["status"] == "done":
+                _auto_stop(text, data)
 
 
 def _auto_stop(log_text: str, parsed: dict):
@@ -369,6 +502,19 @@ def _check_token(token: str | None):
         raise HTTPException(status_code=403, detail="Invalid or missing token")
 
 
+@app.get("/healthz")
+def healthz():
+    return JSONResponse({
+        "version": __version__,
+        "uptime_seconds": int(time.time() - _start_ts),
+        "ssh_health": _ssh_health,
+        "runs_loaded": len(_runs),
+        "ssh_configured": bool(_config.get("ssh_args") or _config.get("ssh_targets")),
+        "auto_stop_enabled": _config.get("auto_stop", False),
+        "auto_stop_triggered": _config.get("auto_stop_done", False),
+    })
+
+
 @app.get("/api/data")
 def api_data(token: str = None):
     _check_token(token)
@@ -376,6 +522,7 @@ def api_data(token: str = None):
     return JSONResponse({
         "runs": _runs,
         "config": {"refresh": _config["refresh"], "log": _config.get("_resolved_log", "")},
+        "ssh_health": _ssh_health,
     })
 
 
@@ -396,7 +543,8 @@ async def upload_log(file: UploadFile = File(...), token: str = None):
 
 @app.get("/", response_class=HTMLResponse)
 def index():
-    return HTML.replace("__PGOLF_TOKEN__", _auth_token)
+    baseline_val = str(_config["baseline"]) if _config["baseline"] is not None else "null"
+    return HTML.replace("__PGOLF_TOKEN__", _auth_token).replace("__PGOLF_BASELINE__", baseline_val)
 
 
 # ---------------------------------------------------------------------------
@@ -465,6 +613,10 @@ header h1 span{color:var(--text);transition:color .2s}
   font-size:11px;font-weight:500;cursor:default;transition:all .15s}
 .run-tag .x{margin-left:8px;color:var(--text3);cursor:pointer;font-size:13px}
 .run-tag .x:hover{color:var(--red)}
+#ssh-health{display:inline-flex;align-items:center;gap:4px;font-size:10px;padding:3px 10px;border-radius:12px;background:var(--surface);border:1px solid var(--border);color:var(--text2);margin-left:8px}
+#ssh-health .sh-dot{font-size:8px}
+.progress-fill.crashed{background:var(--red) !important}
+.error-excerpt{font-size:11px;color:var(--red);padding:4px 24px 12px;font-family:'JetBrains Mono',monospace;word-break:break-all}
 
 /* Progress */
 .progress{padding:0 24px 20px}
@@ -569,8 +721,9 @@ header h1 span{color:var(--text);transition:color .2s}
 
 <script>
 const TOKEN='__PGOLF_TOKEN__';
-// Naive baseline BPB — change this to match your baseline
-const BASELINE=1.2244;
+const BASELINE_CLI='__PGOLF_BASELINE__';
+let BASELINE=BASELINE_CLI!=='null'?parseFloat(BASELINE_CLI):null;
+let _baselineAutoSet=false;
 
 function getPlotTheme(){
   const s=getComputedStyle(document.documentElement);
@@ -726,6 +879,26 @@ function _render(data){
     rl.appendChild(tag);
   });
 
+  // SSH health pill
+  let shEl=document.getElementById('ssh-health');
+  if(data.ssh_health && data.ssh_health.status!=='unknown'){
+    if(!shEl){shEl=document.createElement('span');shEl.id='ssh-health';rl.parentElement.appendChild(shEl)}
+    shEl.textContent='';
+    const dot=document.createElement('span');dot.className='sh-dot';
+    const lbl=document.createElement('span');
+    const h=data.ssh_health;
+    if(h.status==='ok'){dot.style.color='var(--green)';dot.textContent='●';lbl.textContent='connected'}
+    else if(h.status==='stale'){dot.style.color='var(--amber)';dot.textContent='●';const ago=h.last_ok_ts?Math.round(Date.now()/1000-h.last_ok_ts)+'s ago':'';lbl.textContent='stale'+(ago?' ('+ago+')':'')}
+    else if(h.status==='failing'){dot.style.color='var(--red)';dot.textContent='●';lbl.textContent=h.last_error||'failing'}
+    shEl.appendChild(dot);shEl.appendChild(lbl);
+  } else if(shEl){shEl.remove()}
+
+  // Auto-derive baseline from first val_bpb if not set via CLI
+  if(BASELINE===null&&!_baselineAutoSet){
+    const pr=runs[keys[0]];
+    if(pr&&pr.val_bpb&&pr.val_bpb.length>0){BASELINE=pr.val_bpb[0];_baselineAutoSet=true}
+  }
+
   // Use first run for metrics
   const primary=runs[keys[0]];
   const ns=primary.steps.length, nv=primary.val_steps.length, np=primary.pert_chi.length;
@@ -870,6 +1043,18 @@ function _render(data){
     sizeTEl.textContent=(f.artifact_bytes/1000000).toFixed(2)+' MB';
   }
 
+  // Crash display: red progress bar + error excerpt
+  const progFill=document.getElementById('prog-fill');
+  let errEl=document.getElementById('error-excerpt');
+  if(st==='crashed'){
+    progFill.classList.add('crashed');
+    if(!errEl){errEl=document.createElement('div');errEl.id='error-excerpt';errEl.className='error-excerpt';document.getElementById('stages').after(errEl)}
+    errEl.textContent=primary.error_excerpt||'Unknown error';
+  } else {
+    progFill.classList.remove('crashed');
+    if(errEl)errEl.remove();
+  }
+
   const logName=config.log?config.log.split('/').pop():'';
   const t=new Date();
   const timeStr=use24h?t.toLocaleTimeString('en-GB'):t.toLocaleTimeString('en-US');
@@ -887,37 +1072,41 @@ function _render(data){
   const bpbTraces=[];
   // Check if primary run has crossed below baseline
   const BL=BASELINE;
-  const crossed=nv>0&&primary.val_bpb[nv-1]<BL;
-  const blC=crossed?'rgba(255,255,255,':'rgba(255,255,255,';
-  const blStyles={
-    'dot':[{type:'line',x0:0,x1:bpbXmax,y0:BL,y1:BL,line:{color:blC+'0.2)',width:0.5,dash:'dot'}}],
-    'dash':[{type:'line',x0:0,x1:bpbXmax,y0:BL,y1:BL,line:{color:blC+'0.2)',width:0.5,dash:'dash'}}],
-    'longdash':[{type:'line',x0:0,x1:bpbXmax,y0:BL,y1:BL,line:{color:blC+'0.15)',width:0.7,dash:'longdash'}}],
-    'solid':[{type:'line',x0:0,x1:bpbXmax,y0:BL,y1:BL,line:{color:blC+'0.1)',width:0.5}}],
-    'glow':[
-      {type:'line',x0:0,x1:bpbXmax,y0:BL,y1:BL,line:{color:blC+'0.03)',width:10}},
-      {type:'line',x0:0,x1:bpbXmax,y0:BL,y1:BL,line:{color:blC+'0.06)',width:4}},
-      {type:'line',x0:0,x1:bpbXmax,y0:BL,y1:BL,line:{color:blC+'0.15)',width:0.5}},
-    ],
-    'zone':[{type:'rect',x0:0,x1:bpbXmax,y0:BL-0.002,y1:BL+0.002,fillcolor:blC+'0.06)',line:{width:0}}],
-    'dashdot':[{type:'line',x0:0,x1:bpbXmax,y0:BL,y1:BL,line:{color:blC+'0.2)',width:0.5,dash:'dashdot'}}],
-    'thick':[{type:'line',x0:0,x1:bpbXmax,y0:BL,y1:BL,line:{color:blC+'0.08)',width:2}}],
-    'double':[
-      {type:'line',x0:0,x1:bpbXmax,y0:BL-0.001,y1:BL-0.001,line:{color:blC+'0.12)',width:0.3}},
-      {type:'line',x0:0,x1:bpbXmax,y0:BL+0.001,y1:BL+0.001,line:{color:blC+'0.12)',width:0.3}},
-    ],
-    'none':[],
-  };
-  const themeBl={dark:'solid',kitty:'solid',emerald:'solid'};
-  const curTheme=document.documentElement.getAttribute('data-theme')||'dark';
-  const blShapes=blStyles[themeBl[curTheme]||'solid'];
-  const blAnnotColor=crossed?'rgba(255,255,255,0.15)':'rgba(255,255,255,0.25)';
+  let blShapes=[];
+  let blAnnotations=[];
+  if(BL!==null){
+    const crossed=nv>0&&primary.val_bpb[nv-1]<BL;
+    const blC=crossed?'rgba(255,255,255,':'rgba(255,255,255,';
+    const blStyles={
+      'dot':[{type:'line',x0:0,x1:bpbXmax,y0:BL,y1:BL,line:{color:blC+'0.2)',width:0.5,dash:'dot'}}],
+      'dash':[{type:'line',x0:0,x1:bpbXmax,y0:BL,y1:BL,line:{color:blC+'0.2)',width:0.5,dash:'dash'}}],
+      'longdash':[{type:'line',x0:0,x1:bpbXmax,y0:BL,y1:BL,line:{color:blC+'0.15)',width:0.7,dash:'longdash'}}],
+      'solid':[{type:'line',x0:0,x1:bpbXmax,y0:BL,y1:BL,line:{color:blC+'0.1)',width:0.5}}],
+      'glow':[
+        {type:'line',x0:0,x1:bpbXmax,y0:BL,y1:BL,line:{color:blC+'0.03)',width:10}},
+        {type:'line',x0:0,x1:bpbXmax,y0:BL,y1:BL,line:{color:blC+'0.06)',width:4}},
+        {type:'line',x0:0,x1:bpbXmax,y0:BL,y1:BL,line:{color:blC+'0.15)',width:0.5}},
+      ],
+      'zone':[{type:'rect',x0:0,x1:bpbXmax,y0:BL-0.002,y1:BL+0.002,fillcolor:blC+'0.06)',line:{width:0}}],
+      'dashdot':[{type:'line',x0:0,x1:bpbXmax,y0:BL,y1:BL,line:{color:blC+'0.2)',width:0.5,dash:'dashdot'}}],
+      'thick':[{type:'line',x0:0,x1:bpbXmax,y0:BL,y1:BL,line:{color:blC+'0.08)',width:2}}],
+      'double':[
+        {type:'line',x0:0,x1:bpbXmax,y0:BL-0.001,y1:BL-0.001,line:{color:blC+'0.12)',width:0.3}},
+        {type:'line',x0:0,x1:bpbXmax,y0:BL+0.001,y1:BL+0.001,line:{color:blC+'0.12)',width:0.3}},
+      ],
+      'none':[],
+    };
+    const themeBl={dark:'solid',kitty:'solid',emerald:'solid'};
+    const curTheme=document.documentElement.getAttribute('data-theme')||'dark';
+    blShapes=blStyles[themeBl[curTheme]||'solid'];
+    const blAnnotColor=crossed?'rgba(255,255,255,0.15)':'rgba(255,255,255,0.25)';
+    blAnnotations=[{x:bpbXmax,y:BL,xanchor:'right',yanchor:'bottom',
+      text:'baseline '+BL,showarrow:false,font:{size:9,color:blAnnotColor}}];
+  }
   const bpbLayout={...DL,title:'',
     xaxis:{...DL.xaxis,title:'',range:[0,bpbXmax],tick0:1000,dtick:1000},yaxis:{...DL.yaxis,title:'',range:[1.1,1.45]},
     shapes:[...blShapes],
-    annotations:[{x:bpbXmax,y:BL,xanchor:'right',yanchor:'bottom',
-      text:'baseline '+BL,showarrow:false,font:{size:9,color:blAnnotColor}},
-      ]};
+    annotations:[...blAnnotations]};
   keys.forEach((k,i)=>{
     const r=runs[k];
     if(r.val_steps.length){
@@ -1255,7 +1444,7 @@ def main():
     parser = argparse.ArgumentParser(description="Parameter Golf Training Dashboard")
     parser.add_argument("logs", nargs="*", help="Local .log files to display")
     parser.add_argument("--compare", nargs="*", default=[], help="Comparison log files (overlay)")
-    parser.add_argument("--ssh", default=None, help='SSH connection: "root@host -p 1234 -i key"')
+    parser.add_argument("--ssh", action="append", default=None, help='SSH connection: "root@host -p 1234 -i key" (can be repeated)')
     parser.add_argument("--remote-log", default=None, help="Log path on remote host")
     parser.add_argument("--host", default="127.0.0.1",
                         help="Bind address (default: 127.0.0.1; use 0.0.0.0 to expose — NOT RECOMMENDED without firewall)")
@@ -1265,6 +1454,9 @@ def main():
     parser.add_argument("--save-dir", default=".", help="Directory to save logs on auto-stop")
     parser.add_argument("--insecure-host-key", action="store_true",
                         help="Use StrictHostKeyChecking=no (NOT RECOMMENDED — vulnerable to MITM)")
+    parser.add_argument("--baseline", type=float, default=None, help="Baseline BPB value for chart reference line")
+    parser.add_argument("--notify-webhook", default=None, help="Discord/Slack webhook URL for notifications")
+    parser.add_argument("--notify-threshold", type=float, default=None, help="BPB threshold for webhook notification")
     args = parser.parse_args()
 
     _config["local_files"] = args.logs
@@ -1272,11 +1464,28 @@ def main():
     _config["refresh"] = args.refresh
     _config["auto_stop"] = args.auto_stop
     _config["save_dir"] = args.save_dir
+    _config["baseline"] = args.baseline
+    _config["webhook_url"] = args.notify_webhook
+    _config["webhook_threshold"] = args.notify_threshold
     if args.ssh:
-        ssh_args = _parse_ssh_string(args.ssh, insecure=args.insecure_host_key)
-        _config["ssh_args"] = ssh_args
-        _config["ssh_host"] = _extract_ssh_host(ssh_args)
-        _config["remote_log"] = args.remote_log or "LATEST"
+        remote_log = args.remote_log or "LATEST"
+        for idx, ssh_str in enumerate(args.ssh):
+            ssh_args = _parse_ssh_string(ssh_str, insecure=args.insecure_host_key)
+            ssh_host = _extract_ssh_host(ssh_args)
+            target = {
+                "ssh_args": ssh_args,
+                "ssh_host": ssh_host,
+                "label": f"pod-{idx}" if len(args.ssh) > 1 else "SSH",
+                "remote_log": remote_log,
+                "byte_offset": 0,
+                "local_cache": "",
+                "health": {"last_ok_ts": 0, "consecutive_failures": 0, "last_error": "", "status": "unknown"},
+            }
+            _config["ssh_targets"].append(target)
+        # Keep backward compat: set ssh_args/ssh_host from first target
+        _config["ssh_args"] = _config["ssh_targets"][0]["ssh_args"]
+        _config["ssh_host"] = _config["ssh_targets"][0]["ssh_host"]
+        _config["remote_log"] = remote_log
 
     if args.host == "0.0.0.0":
         print("\n\033[93m  WARNING: Dashboard bound to 0.0.0.0 — anyone on your network can access it.\033[0m")
@@ -1289,7 +1498,15 @@ def main():
     if args.compare:
         print(f"  Compare: {args.compare}")
     if args.ssh:
-        print(f"  SSH: {args.ssh} -> {_config['remote_log']}")
+        for idx, ssh_str in enumerate(args.ssh):
+            label = _config["ssh_targets"][idx]["label"]
+            print(f"  SSH [{label}]: {ssh_str} -> {_config['remote_log']}")
+    if args.notify_webhook:
+        print(f"  Webhook: {args.notify_webhook}")
+        if args.notify_threshold:
+            print(f"  Notify threshold: {args.notify_threshold}")
+    if args.baseline is not None:
+        print(f"  Baseline BPB: {args.baseline}")
     if not args.logs and not args.ssh:
         print("  No data source — drag & drop .log files in browser")
 

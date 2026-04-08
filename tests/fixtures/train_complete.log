@@ -1,0 +1,26 @@
+world_size:8 gpu:NVIDIA H100 80GB HBM3  model_params:14500000 seed:42 num_repeats:4 grad_accum_steps:1 max_wallclock_seconds:600 iterations:20000 train_batch_tokens:524288
+prog_depth: schedule=[(0.3, 2), (0.5, 3), (1.0, 4)] starting_repeats=2
+warmup_step:1/50
+warmup_step:50/50
+step:50/20000 val_loss:3.8500 val_bpb:5.5525
+step:50/20000 train_loss:3.8200 train_time:5200ms step_avg:104.0ms
+step:100/20000 train_loss:3.5100 train_time:10400ms step_avg:104.0ms
+step:100/20000 val_loss:3.4000 val_bpb:4.9029
+prog_depth: switched to 3 repeats at step:1500
+step:1500/20000 train_loss:2.1000 train_time:156000ms step_avg:104.0ms
+step:1500/20000 val_loss:2.0500 val_bpb:2.9561
+prog_depth: switched to 4 repeats at step:2500
+step:2500/20000 train_loss:1.5000 train_time:260000ms step_avg:104.0ms
+step:2500/20000 val_loss:1.4800 val_bpb:2.1349
+step:5000/20000 train_loss:0.9500 train_time:520000ms step_avg:104.0ms chi:3.1
+step:5000/20000 val_loss:0.8700 val_bpb:1.2546
+swa: averaging 44 checkpoints
+step:5414/20000 val_loss:0.8300 val_bpb:1.1973
+peak memory: 72.3 GiB
+Serialized model int8_zstd22: 15234567 bytes
+final_roundtrip val_loss:0.8310 val_bpb:1.1987 eval_time:45000ms
+final_roundtrip_exact val_loss:0.8310 val_bpb:1.1987
+final_sliding_window val_loss:0.8280 val_bpb:1.1960 eval_time:120000ms
+final_sliding_window_exact val_loss:0.8280 val_bpb:1.1960
+final_hedge_mixer val_loss:0.7935 val_bpb:1.1441 eval_time:162000ms
+final_hedge_mixer_exact val_loss:0.7935 val_bpb:1.1441

@@ -1,0 +1,4 @@
+world_size:8 gpu:NVIDIA H100 80GB HBM3  model_params:14500000 seed:42 max_wallclock_seconds:600 iterations:20000
+warmup_step:1/50
+warmup_step:10/50
+warmup_step:25/50
