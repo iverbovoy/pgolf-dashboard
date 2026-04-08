@@ -24,15 +24,18 @@ import re
 import secrets
 import shlex
 import subprocess
+import threading
 import time
+import urllib.request
 from pathlib import Path
+
+from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+import uvicorn
 
 __version__ = "0.2.0"
 _start_ts = time.time()
-
-from fastapi import FastAPI, UploadFile, File
-from fastapi.responses import HTMLResponse, JSONResponse
-import uvicorn
+MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50 MB
 
 # ---------------------------------------------------------------------------
 # State
@@ -171,8 +174,6 @@ def parse_log(text: str) -> dict:
         m = re.search(r"swa: averaging (\d+) checkpoints", line)
         if m:
             d["swa_count"] = int(m.group(1))
-        if "stopping_early" in line or "step:" in line and f"/{d['config'].get('iterations', 0)}" in line:
-            pass  # status updated below
         if "peak memory" in line:
             d["peak_mem"] = line.strip()
         if "Serialized model int" in line:
@@ -242,6 +243,13 @@ def _extract_ssh_host(ssh_args: list[str]) -> str | None:
 _SAFE_LOG_PATH = re.compile(r"^/[\w./_-]+\.log$")
 
 
+def _cache_path() -> Path:
+    """Return a secure cache file path under ~/.pgolf_cache/."""
+    d = Path.home() / ".pgolf_cache"
+    d.mkdir(mode=0o700, exist_ok=True)
+    return d / "ssh_cache.log"
+
+
 def _fetch_ssh_target(target: dict) -> str:
     """Fetch log from a single SSH target with incremental tailing and health tracking."""
     ssh_args = target["ssh_args"]
@@ -293,7 +301,7 @@ def _fetch_ssh_target(target: dict) -> str:
             health["status"] = "ok"
             result = target["local_cache"]
             if result:
-                Path("/tmp/pgolf_ssh_cache.log").write_text(result)
+                _cache_path().write_text(result)
             return result
         else:
             # stat failed — fallback to full cat
@@ -307,7 +315,7 @@ def _fetch_ssh_target(target: dict) -> str:
                 health["consecutive_failures"] = 0
                 health["last_error"] = ""
                 health["status"] = "ok"
-                Path("/tmp/pgolf_ssh_cache.log").write_text(r.stdout)
+                _cache_path().write_text(r.stdout)
                 return r.stdout
             raise RuntimeError(f"cat failed: rc={r.returncode}")
     except Exception as e:
@@ -319,7 +327,7 @@ def _fetch_ssh_target(target: dict) -> str:
         elif cf >= 2:
             health["status"] = "stale"
     # Fallback: local cache file
-    cache = Path("/tmp/pgolf_ssh_cache.log")
+    cache = _cache_path()
     if cache.exists():
         t = cache.read_text()
         target["local_cache"] = t
@@ -347,7 +355,6 @@ def _send_webhook(run_data: dict, event: str):
     """Send notification to Discord/Slack webhook."""
     if not _config.get("webhook_url"):
         return
-    import urllib.request
     finals = run_data.get("finals", {})
     best_bpb = finals.get("hedge") or finals.get("sliding") or finals.get("roundtrip") or "N/A"
     artifact_mb = f'{finals["artifact_bytes"]/1e6:.2f} MB' if "artifact_bytes" in finals else "N/A"
@@ -430,7 +437,6 @@ def load_all_runs():
 
 def _auto_stop(log_text: str, parsed: dict):
     """Save log locally and stop the RunPod pod matching our SSH target."""
-    import threading
     _config["auto_stop_done"] = True
 
     # Verify all expected eval stages completed (not just a substring match)
@@ -497,7 +503,6 @@ app = FastAPI()
 
 def _check_token(token: str | None):
     """Verify auth token. Raises 403 if invalid."""
-    from fastapi import HTTPException
     if token != _auth_token:
         raise HTTPException(status_code=403, detail="Invalid or missing token")
 
@@ -529,7 +534,10 @@ def api_data(token: str = None):
 @app.post("/api/upload")
 async def upload_log(file: UploadFile = File(...), token: str = None):
     _check_token(token)
-    text = (await file.read()).decode("utf-8", errors="replace")
+    raw = await file.read()
+    if len(raw) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail=f"File too large (max {MAX_UPLOAD_BYTES // 1024 // 1024} MB)")
+    text = raw.decode("utf-8", errors="replace")
     data = parse_log(text)
     raw_name = Path(file.filename or "uploaded").name
     name = re.sub(r"[^\w.\-]", "_", raw_name)[:128]
@@ -1455,7 +1463,6 @@ def get_log(token: str = None):
             if p.exists():
                 text = p.read_text()
                 break
-    from fastapi.responses import PlainTextResponse
     return PlainTextResponse(text or "no log available", media_type="text/plain")
 
 
