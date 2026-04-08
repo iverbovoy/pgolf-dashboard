@@ -21,6 +21,8 @@ Options:
 import argparse
 import json
 import re
+import secrets
+import shlex
 import subprocess
 import time
 from pathlib import Path
@@ -34,8 +36,10 @@ import uvicorn
 # ---------------------------------------------------------------------------
 _runs: dict[str, dict] = {}  # name -> parsed data
 _ssh_cache = {"text": "", "ts": 0}
+_auth_token: str = secrets.token_urlsafe(24)
 _config = {
-    "ssh_cmd": None,
+    "ssh_args": None,   # list[str] — parsed SSH arguments (no shell interpolation)
+    "ssh_host": None,    # str — extracted host for pod matching
     "remote_log": None,
     "refresh": 180,
     "local_files": [],
@@ -63,9 +67,9 @@ def parse_log(text: str) -> dict:
     for line in text.splitlines():
         # Config
         # Parse key:value pairs from config lines
-        m = re.search(r"gpu:(.+?)(?:\s|$)", line)
+        m = re.search(r"gpu:([\w.\-:/()+ ]+?)(?:\s{2,}|$)", line)
         if m:
-            d["config"]["gpu"] = m.group(1).strip()
+            d["config"]["gpu"] = re.sub(r"[^\w.\-:/()+ ]", "", m.group(1).strip())[:80]
         for key in ["world_size", "model_params", "seed", "num_repeats", "grad_accum_steps"]:
             m = re.search(rf"\b{key}:(\d+)", line)
             if m:
@@ -183,8 +187,42 @@ def parse_log(text: str) -> dict:
     return d
 
 
+def _parse_ssh_string(ssh_str: str, insecure: bool = False) -> list[str]:
+    """Parse an SSH connection string into a safe argv list."""
+    parts = shlex.split(ssh_str)
+    host_key_policy = "no" if insecure else "accept-new"
+    ssh_opts = [
+        "-o", f"StrictHostKeyChecking={host_key_policy}",
+        "-o", "UserKnownHostsFile=~/.ssh/pgolf_known_hosts",
+        "-o", "ConnectTimeout=10",
+        "-o", "ServerAliveInterval=30",
+        "-o", "ServerAliveCountMax=3",
+    ]
+    return ["ssh"] + parts + ssh_opts
+
+
+def _extract_ssh_host(ssh_args: list[str]) -> str | None:
+    """Extract the target host from parsed SSH args for pod matching."""
+    skip_next = False
+    for arg in ssh_args[1:]:  # skip "ssh"
+        if skip_next:
+            skip_next = False
+            continue
+        if arg in ("-p", "-i", "-o", "-l", "-F", "-J"):
+            skip_next = True
+            continue
+        if arg.startswith("-"):
+            continue
+        # First non-flag arg is [user@]host
+        return arg.split("@")[-1] if "@" in arg else arg
+    return None
+
+
+_SAFE_LOG_PATH = re.compile(r"^/[\w./_-]+\.log$")
+
+
 def fetch_ssh_log() -> str:
-    if not _config["ssh_cmd"] or not _config["remote_log"]:
+    if not _config["ssh_args"] or not _config["remote_log"]:
         return ""
     now = time.time()
     if now - _ssh_cache["ts"] < 5 and _ssh_cache["text"]:
@@ -194,15 +232,20 @@ def fetch_ssh_log() -> str:
         if remote == "LATEST":
             # Always re-resolve to pick up new log files
             lr = subprocess.run(
-                f'{_config["ssh_cmd"]} "ls -t /workspace/*.log 2>/dev/null | head -1"',
-                shell=True, capture_output=True, text=True, timeout=10)
+                _config["ssh_args"] + ["ls -t /workspace/*.log 2>/dev/null | head -1"],
+                capture_output=True, text=True, timeout=10)
             new_remote = lr.stdout.strip() or "/workspace/train.log"
+            # Validate filename to prevent injection via crafted filenames
+            if not _SAFE_LOG_PATH.match(new_remote):
+                print(f"[warn] Ignoring suspicious log filename: {new_remote!r}")
+                return ""
             if new_remote != _config.get("_resolved_log"):
                 _ssh_cache.update(text="", ts=0)  # Reset cache for new file
             remote = new_remote
             _config["_resolved_log"] = remote
-        cmd = f'{_config["ssh_cmd"]} "cat {remote}"'
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=20)
+        r = subprocess.run(
+            _config["ssh_args"] + [f"cat {remote}"],
+            capture_output=True, text=True, timeout=20)
         if r.returncode == 0 and r.stdout.strip():
             _ssh_cache.update(text=r.stdout, ts=now)
             # Cache locally
@@ -249,13 +292,20 @@ def load_all_runs():
         _runs["ssh"] = data
         # Auto-stop: save log + stop pod when done
         if _config["auto_stop"] and not _config["auto_stop_done"] and data["status"] == "done":
-            _auto_stop(text)
+            _auto_stop(text, data)
 
 
-def _auto_stop(log_text: str):
-    """Save log locally and stop the RunPod pod."""
+def _auto_stop(log_text: str, parsed: dict):
+    """Save log locally and stop the RunPod pod matching our SSH target."""
     import threading
     _config["auto_stop_done"] = True
+
+    # Verify all expected eval stages completed (not just a substring match)
+    finals = parsed.get("finals", {})
+    if "roundtrip" not in finals:
+        print("[auto-stop] Roundtrip eval not found — refusing to stop pod.")
+        _config["auto_stop_done"] = False
+        return
 
     def do_stop():
         # Save log
@@ -268,20 +318,38 @@ def _auto_stop(log_text: str):
         # Wait a bit for final dashboard refresh
         time.sleep(30)
 
-        # Stop pod via runpodctl
+        # Match pod by SSH target host
+        target_host = _config.get("ssh_host")
+        if not target_host:
+            print("[auto-stop] No SSH host configured — cannot identify pod. Refusing to stop.")
+            return
+
         try:
-            r = subprocess.run("runpodctl get pod", shell=True, capture_output=True, text=True, timeout=10)
-            if r.returncode == 0:
-                # Find running pod ID
-                for line in r.stdout.strip().split("\n")[1:]:
-                    parts = line.split()
-                    if len(parts) >= 2 and parts[1] == "RUNNING":
-                        pod_id = parts[0]
-                        print(f"[auto-stop] Stopping pod {pod_id}...")
-                        subprocess.run(f"runpodctl stop pod {pod_id}", shell=True, timeout=10)
-                        print(f"[auto-stop] Pod stopped.")
-                        return
-            print("[auto-stop] No running pod found or runpodctl failed.")
+            r = subprocess.run(
+                ["runpodctl", "get", "pod"],
+                capture_output=True, text=True, timeout=10)
+            if r.returncode != 0:
+                print(f"[auto-stop] runpodctl failed: {r.stderr}")
+                return
+            # Find pod matching our SSH target IP
+            matched_pods = []
+            for line in r.stdout.strip().split("\n")[1:]:
+                parts = line.split()
+                if len(parts) >= 2 and parts[1] == "RUNNING":
+                    pod_id = parts[0]
+                    # Check if any column contains our target host
+                    if any(target_host in p for p in parts):
+                        matched_pods.append(pod_id)
+            if not matched_pods:
+                print(f"[auto-stop] No RUNNING pod matches SSH host {target_host}. Refusing to stop any pod.")
+                return
+            if len(matched_pods) > 1:
+                print(f"[auto-stop] Multiple pods match {target_host}: {matched_pods}. Refusing to guess.")
+                return
+            pod_id = matched_pods[0]
+            print(f"[auto-stop] Stopping pod {pod_id} (matched {target_host})...")
+            subprocess.run(["runpodctl", "stop", "pod", pod_id], timeout=10)
+            print(f"[auto-stop] Pod {pod_id} stopped.")
         except Exception as e:
             print(f"[auto-stop] Error: {e}")
 
@@ -294,29 +362,30 @@ def _auto_stop(log_text: str):
 app = FastAPI()
 
 
+def _check_token(token: str | None):
+    """Verify auth token. Raises 403 if invalid."""
+    from fastapi import HTTPException
+    if token != _auth_token:
+        raise HTTPException(status_code=403, detail="Invalid or missing token")
+
+
 @app.get("/api/data")
-def api_data(ssh: str = None, log: str = None):
-    # Dynamic SSH override via URL params: ?ssh=root@host:port&log=/path/to/log
-    if ssh:
-        if ":" in ssh:
-            host_part, port = ssh.rsplit(":", 1)
-            _config["ssh_cmd"] = f"ssh {host_part} -p {port} -o StrictHostKeyChecking=no -o ConnectTimeout=10"
-        else:
-            _config["ssh_cmd"] = f"ssh {ssh} -o StrictHostKeyChecking=no -o ConnectTimeout=10"
-        _config["remote_log"] = "LATEST" if (not log or log.lower() == "latest") else log
-        _ssh_cache["ts"] = 0  # force re-fetch
+def api_data(token: str = None):
+    _check_token(token)
     load_all_runs()
     return JSONResponse({
         "runs": _runs,
-        "config": {"refresh": _config["refresh"], "ssh": ssh or "", "log": _config.get("_resolved_log", log or "")},
+        "config": {"refresh": _config["refresh"], "log": _config.get("_resolved_log", "")},
     })
 
 
 @app.post("/api/upload")
-async def upload_log(file: UploadFile = File(...)):
+async def upload_log(file: UploadFile = File(...), token: str = None):
+    _check_token(token)
     text = (await file.read()).decode("utf-8", errors="replace")
     data = parse_log(text)
-    name = file.filename or "uploaded"
+    raw_name = Path(file.filename or "uploaded").name
+    name = re.sub(r"[^\w.\-]", "_", raw_name)[:128]
     data["name"] = name
     data["source"] = "upload"
     key = f"upload_{name}_{int(time.time())}"
@@ -327,7 +396,7 @@ async def upload_log(file: UploadFile = File(...)):
 
 @app.get("/", response_class=HTMLResponse)
 def index():
-    return HTML
+    return HTML.replace("__PGOLF_TOKEN__", _auth_token)
 
 
 # ---------------------------------------------------------------------------
@@ -456,8 +525,8 @@ header h1 span{color:var(--text);transition:color .2s}
 </div>
 <header>
   <div class="hdr-left">
-    <input id="ssh-input" type="text" placeholder="root@host:port" spellcheck="false">
-    <button id="ssh-btn" onclick="connectSSH()">Connect</button>
+    <input id="ssh-input" type="text" placeholder="root@host:port" spellcheck="false" style="display:none">
+    <button id="ssh-btn" style="display:none">Connect</button>
     <div class="run-list" id="run-list"></div>
   </div>
   <span id="status"><span id="s-time" style="display:none"></span></span>
@@ -499,6 +568,7 @@ header h1 span{color:var(--text);transition:color .2s}
 
 
 <script>
+const TOKEN='__PGOLF_TOKEN__';
 // Naive baseline BPB — change this to match your baseline
 const BASELINE=1.2244;
 
@@ -611,10 +681,7 @@ function _render(data){
   }
   if(!keys.length){const st=document.getElementById('s-time');if(st)st.innerText='No data';return}
 
-  // Hide SSH input when connected
   const hasSSH=keys.some(k=>runs[k].source==='ssh');
-  document.getElementById('ssh-input').style.display=hasSSH?'none':'';
-  document.getElementById('ssh-btn').style.display=hasSSH?'none':'';
 
   // Run list
   const rl=document.getElementById('run-list');
@@ -629,8 +696,33 @@ function _render(data){
     const gpuInfo=r.config.gpu?' · '+r.config.gpu:'';
     const wsInfo=r.config.world_size?r.config.world_size+'×':'';
     const hwInfo=r.config.gpu?(wsInfo+r.config.gpu):'';
-    tag.innerHTML=`<span id="live-dot" style="color:var(--green);opacity:0.25;transition:opacity 0.8s ease,text-shadow 0.8s ease">●</span>&nbsp; ${r.source==='ssh'?'live'+(hwInfo?' · <span style="color:var(--text3);font-size:10px">'+hwInfo+'</span>':''):r.name||k}`;
-    if(r.source==='upload'){tag.innerHTML+=`<span class="x" onclick="event.stopPropagation();removeRun('${k}')">×</span>`}
+    // Build tag content safely via DOM API (no innerHTML — prevents XSS via filename/gpu)
+    const dot=document.createElement('span');
+    dot.id='live-dot';
+    dot.style.cssText='color:var(--green);opacity:0.25;transition:opacity 0.8s ease,text-shadow 0.8s ease';
+    dot.textContent='●';
+    tag.appendChild(dot);
+    tag.appendChild(document.createTextNode('\u00a0 '));
+    const label=document.createElement('span');
+    if(r.source==='ssh'){
+      label.textContent='live';
+      if(hwInfo){
+        const hw=document.createElement('span');
+        hw.style.cssText='color:var(--text3);font-size:10px';
+        hw.textContent=' · '+hwInfo;
+        label.appendChild(hw);
+      }
+    } else {
+      label.textContent=r.name||k;
+    }
+    tag.appendChild(label);
+    if(r.source==='upload'){
+      const x=document.createElement('span');
+      x.className='x';
+      x.textContent='×';
+      x.addEventListener('click',function(e){e.stopPropagation();removeRun(k)});
+      tag.appendChild(x);
+    }
     rl.appendChild(tag);
   });
 
@@ -974,28 +1066,11 @@ document.getElementById('logo-h1').addEventListener('click',()=>{
   crystallize();
 })();
 
-// SSH connect from UI
-let sshParam='', logParam='';
-function connectSSH(){
-  sshParam=document.getElementById('ssh-input').value.trim();
-  logParam='';
-  if(sshParam){
-    // Save to URL for bookmarking
-    const u=new URL(window.location);
-    u.searchParams.set('ssh',sshParam);
-    u.searchParams.set('log',logParam);
-    history.replaceState(null,'',u);
-    refresh();
-  }
+// SSH is now configured via CLI --ssh flag only (no browser-side SSH to prevent RCE)
+async function removeRun(key){
+  await fetch(`/api/remove?key=${encodeURIComponent(key)}&token=${encodeURIComponent(TOKEN)}`,{method:'POST'});
+  refresh();
 }
-// Load from URL on startup
-(function(){
-  const u=new URL(window.location);
-  const s=u.searchParams.get('ssh');
-  if(s){sshParam=s;document.getElementById('ssh-input').value=s}
-})();
-// Enter key in inputs
-document.getElementById('ssh-input').addEventListener('keydown',e=>{if(e.key==='Enter')connectSSH()});
 document.getElementById('s-time').addEventListener('click',()=>{use24h=!use24h;localStorage.setItem('pgolf-24h',use24h);refresh()});
 function cycleRate(){
   rateManual=true;
@@ -1009,12 +1084,7 @@ function cycleRate(){
 
 async function refresh(){
   try{
-    let url='/api/data';
-    if(sshParam){
-      url+=`?ssh=${encodeURIComponent(sshParam)}`;
-      if(logParam)url+=`&log=${encodeURIComponent(logParam)}`;
-    }
-    const r=await fetch(url);const d=await r.json();render(d);
+    const r=await fetch(`/api/data?token=${encodeURIComponent(TOKEN)}`);const d=await r.json();render(d);
     if(Object.keys(d.runs).length&&window._hideLoading)window._hideLoading();
     const dot=document.getElementById('live-dot');
     if(dot){dot.style.opacity='1';dot.style.textShadow='0 0 8px var(--green),0 0 16px var(--green)';setTimeout(()=>{dot.style.opacity='0.25';dot.style.textShadow='none'},800)}
@@ -1156,15 +1226,17 @@ refreshTimer=setInterval(()=>refresh(), refreshInterval);
 # ---------------------------------------------------------------------------
 # Remove uploaded run
 # ---------------------------------------------------------------------------
-@app.get("/api/remove")
-def remove_run(key: str):
+@app.post("/api/remove")
+def remove_run(key: str, token: str = None):
+    _check_token(token)
     _runs.pop(key, None)
     return JSONResponse({"status": "ok"})
 
 
 @app.get("/api/log")
-def get_log():
+def get_log(token: str = None):
     """Return raw log text for download."""
+    _check_token(token)
     text = fetch_ssh_log()
     if not text:
         for f in _config["local_files"]:
@@ -1185,10 +1257,14 @@ def main():
     parser.add_argument("--compare", nargs="*", default=[], help="Comparison log files (overlay)")
     parser.add_argument("--ssh", default=None, help='SSH connection: "root@host -p 1234 -i key"')
     parser.add_argument("--remote-log", default=None, help="Log path on remote host")
+    parser.add_argument("--host", default="127.0.0.1",
+                        help="Bind address (default: 127.0.0.1; use 0.0.0.0 to expose — NOT RECOMMENDED without firewall)")
     parser.add_argument("--port", type=int, default=8050)
     parser.add_argument("--refresh", type=int, default=180, help="Auto-refresh seconds")
     parser.add_argument("--auto-stop", action="store_true", help="Auto-save log and stop RunPod pod when training completes")
     parser.add_argument("--save-dir", default=".", help="Directory to save logs on auto-stop")
+    parser.add_argument("--insecure-host-key", action="store_true",
+                        help="Use StrictHostKeyChecking=no (NOT RECOMMENDED — vulnerable to MITM)")
     args = parser.parse_args()
 
     _config["local_files"] = args.logs
@@ -1197,10 +1273,17 @@ def main():
     _config["auto_stop"] = args.auto_stop
     _config["save_dir"] = args.save_dir
     if args.ssh:
-        _config["ssh_cmd"] = f"ssh {args.ssh} -o StrictHostKeyChecking=no -o ConnectTimeout=10"
+        ssh_args = _parse_ssh_string(args.ssh, insecure=args.insecure_host_key)
+        _config["ssh_args"] = ssh_args
+        _config["ssh_host"] = _extract_ssh_host(ssh_args)
         _config["remote_log"] = args.remote_log or "LATEST"
 
-    print(f"Dashboard: http://localhost:{args.port}")
+    if args.host == "0.0.0.0":
+        print("\n\033[93m  WARNING: Dashboard bound to 0.0.0.0 — anyone on your network can access it.\033[0m")
+        print("  Use --host 127.0.0.1 to restrict to this machine.\n")
+
+    print(f"Dashboard: http://localhost:{args.port}?token={_auth_token}")
+    print(f"  Auth token: {_auth_token}")
     if args.logs:
         print(f"  Local logs: {args.logs}")
     if args.compare:
@@ -1210,7 +1293,7 @@ def main():
     if not args.logs and not args.ssh:
         print("  No data source — drag & drop .log files in browser")
 
-    uvicorn.run(app, host="0.0.0.0", port=args.port, log_level="warning")
+    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 
 
 if __name__ == "__main__":
